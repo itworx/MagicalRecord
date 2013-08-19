@@ -16,6 +16,7 @@
 
 + (void) setupCoreDataStackWithStoreNamed:(NSString *)storeName;
 + (void) setupCoreDataStackWithAutoMigratingSqliteStoreNamed:(NSString *)storeName;
++ (void) setupCoreDataStackWithPersistenceCoordinator:(NSPersistentStoreCoordinator *)coordinator;
 
 
 @end

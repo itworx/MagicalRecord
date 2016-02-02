@@ -5,9 +5,13 @@
 //  Copyright 2010 Magical Panda Software, LLC All rights reserved.
 //
 
-#import "CoreData+MagicalRecord.h"
+#import "NSManagedObjectContext+MagicalRecord.h"
+#import "NSManagedObjectContext+MagicalObserving.h"
+#import "NSManagedObjectContext+MagicalThreading.h"
+#import "NSPersistentStoreCoordinator+MagicalRecord.h"
+#import "MagicalRecord+ErrorHandling.h"
+#import "MagicalRecord+iCloud.h"
 #import "MagicalRecordLogging.h"
-#import <objc/runtime.h>
 
 static NSString * const MagicalRecordContextWorkingName = @"MagicalRecordContextWorkingName";
 
@@ -47,6 +51,7 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
 
 + (NSManagedObjectContext *) MR_rootSavingContext;
 {
+    NSAssert(MagicalRecordRootSavingContext != nil, @"Root saving context is nil! Did you forget to initialize the Core Data Stack?");
     return MagicalRecordRootSavingContext;
 }
 
@@ -73,9 +78,8 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
         context = [self MR_newPrivateQueueContext];
         [context performBlockAndWait:^{
             [context setPersistentStoreCoordinator:coordinator];
+            MRLogVerbose(@"Created new context %@ with store coordinator: %@", [context MR_workingName], coordinator);
         }];
-        
-        MRLogVerbose(@"Created new context %@ with store coordinator: %@", [context MR_workingName], coordinator);
     }
     return context;
 }
@@ -96,25 +100,43 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
 
 #pragma mark - Debugging
 
-- (void) MR_setWorkingName:(NSString *)workingName
+- (void)MR_setWorkingName:(NSString *)workingName
 {
-    [self performBlockAndWait:^{
+    void (^setWorkingName)() = ^{
         [[self userInfo] setObject:workingName forKey:MagicalRecordContextWorkingName];
-    }];
+    };
+
+    if (self.concurrencyType == NSMainQueueConcurrencyType && [NSThread isMainThread])
+    {
+        setWorkingName();
+    }
+    else
+    {
+        [self performBlockAndWait:setWorkingName];
+    }
 }
 
-- (NSString *) MR_workingName
+- (NSString *)MR_workingName
 {
     __block NSString *workingName;
 
-    [self performBlockAndWait:^{
+    void (^getWorkingName)() = ^{
         workingName = [[self userInfo] objectForKey:MagicalRecordContextWorkingName];
+    };
 
-        if ([workingName length] == 0)
-        {
-            workingName = @"Untitled Context";
-        }
-    }];
+    if (self.concurrencyType == NSMainQueueConcurrencyType && [NSThread isMainThread])
+    {
+        getWorkingName();
+    }
+    else
+    {
+        [self performBlockAndWait:getWorkingName];
+    }
+
+    if ([workingName length] == 0)
+    {
+        workingName = @"Untitled Context";
+    }
 
     return workingName;
 }
@@ -123,7 +145,13 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
 {
     NSString *onMainThread = [NSThread isMainThread] ? @"the main thread" : @"a background thread";
 
-    return [NSString stringWithFormat:@"<%@ (%p): %@> on %@", NSStringFromClass([self class]), self, [self MR_workingName], onMainThread];
+    __block NSString *workingName;
+
+    [self performBlockAndWait:^{
+        workingName = [self MR_workingName];
+    }];
+
+    return [NSString stringWithFormat:@"<%@ (%p): %@> on %@", NSStringFromClass([self class]), self, workingName, onMainThread];
 }
 
 - (NSString *) MR_parentChain
@@ -184,14 +212,25 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
     }
 }
 
-+ (void)rootContextChanged:(NSNotification *)notification
++ (void)rootContextDidSave:(NSNotification *)notification
 {
-    if ([NSThread isMainThread] == NO) {
+    if ([notification object] != [self MR_rootSavingContext])
+    {
+        return;
+    }
+
+    if ([NSThread isMainThread] == NO)
+    {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self rootContextChanged:notification];
+            [self rootContextDidSave:notification];
         });
 
         return;
+    }
+
+    for (NSManagedObject *object in [[notification userInfo] objectForKey:NSUpdatedObjectsKey])
+    {
+        [[[self MR_defaultContext] objectWithID:[object objectID]] willAccessValueForKey:nil];
     }
 
     [[self MR_defaultContext] mergeChangesFromContextDidSaveNotification:notification];
@@ -241,7 +280,7 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
 
     if ((MagicalRecordDefaultContext != nil) && ([self MR_rootSavingContext] != nil)) {
         [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(rootContextChanged:)
+                                                 selector:@selector(rootContextDidSave:)
                                                      name:NSManagedObjectContextDidSaveNotification
                                                    object:[self MR_rootSavingContext]];
     }
@@ -264,7 +303,7 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
     MRLogInfo(@"Set default context: %@", MagicalRecordDefaultContext);
 }
 
-+ (void) MR_setRootSavingContext:(NSManagedObjectContext *)context
++ (void)MR_setRootSavingContext:(NSManagedObjectContext *)context
 {
     if (MagicalRecordRootSavingContext)
     {
@@ -272,9 +311,13 @@ static id MagicalRecordUbiquitySetupNotificationObserver;
     }
 
     MagicalRecordRootSavingContext = context;
-    [context MR_obtainPermanentIDsBeforeSaving];
-    [MagicalRecordRootSavingContext setMergePolicy:NSMergeByPropertyObjectTrumpMergePolicy];
-    [MagicalRecordRootSavingContext MR_setWorkingName:@"MagicalRecord Root Saving Context"];
+    
+    [MagicalRecordRootSavingContext performBlock:^{
+        [MagicalRecordRootSavingContext MR_obtainPermanentIDsBeforeSaving];
+        [MagicalRecordRootSavingContext setMergePolicy:NSMergeByPropertyObjectTrumpMergePolicy];
+        [MagicalRecordRootSavingContext MR_setWorkingName:@"MagicalRecord Root Saving Context"];
+    }];
+
     MRLogInfo(@"Set root saving context: %@", MagicalRecordRootSavingContext);
 }
 
